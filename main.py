@@ -8,6 +8,17 @@ from dotenv import load_dotenv
 load_dotenv()  # Load DB creds from .env
 
 app = FastAPI()
+
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or specific domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN")
 DB_URL = os.getenv("POSTGRES_URL")  # e.g. "postgresql://user:pass@host:25060/dbname"
 
