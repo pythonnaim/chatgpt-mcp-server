@@ -20,8 +20,6 @@ class JsonRpcRequest(BaseModel):
 
 @app.post("/mcp")
 async def mcp_handler(req: Request, authorization: str = Header(None)):
-    if authorization != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
 
     body = await req.json()
     try:
