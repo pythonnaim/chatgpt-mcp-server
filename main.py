@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Header
 from pydantic import BaseModel
 import psycopg
 import os
@@ -35,7 +35,6 @@ async def mcp_handler(req: Request, authorization: str = Header(None)):
     # if authorization != f"Bearer {AUTH_TOKEN}":
     #     raise HTTPException(status_code=401, detail="Unauthorized")
 
-    body = await req.json()
     try:
         body = await req.json()
         rpc = JsonRpcRequest(**body)
@@ -57,17 +56,14 @@ async def mcp_handler(req: Request, authorization: str = Header(None)):
             "error": {"code": -32600, "message": "Invalid request"},
             "id": None
         }
-        return {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request"}, "id": None}
 
     try:
         if method == "fetch_data":
             rows = run_query(query, full_db_url)
-            rows = run_query(query)
             return {"jsonrpc": "2.0", "id": rpc.id, "result": {"rows": rows}}
 
         elif method == "execute_query":
             row_count = run_exec(query, full_db_url)
-            row_count = run_exec(query)
             return {"jsonrpc": "2.0", "id": rpc.id, "result": {"row_count": row_count}}
 
         else:
@@ -76,7 +72,6 @@ async def mcp_handler(req: Request, authorization: str = Header(None)):
                 "error": {"code": -32601, "message": "Method not found"},
                 "id": rpc.id
             }
-            return {"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": rpc.id}
 
     except Exception as e:
         return {
@@ -84,19 +79,18 @@ async def mcp_handler(req: Request, authorization: str = Header(None)):
             "error": {"code": -32000, "message": str(e)},
             "id": rpc.id
         }
-        return {"jsonrpc": "2.0", "error": {"code": -32000, "message": str(e)}, "id": rpc.id}
 
 
-def run_query(query: str):
-    with psycopg.connect(DB_URL, autocommit=True) as conn:
+def run_query(query: str, db_url: str):
+    with psycopg.connect(db_url, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(query)
             colnames = [desc[0] for desc in cur.description]
             return [dict(zip(colnames, row)) for row in cur.fetchall()]
 
 
-def run_exec(query: str):
-    with psycopg.connect(DB_URL, autocommit=True) as conn:
+def run_exec(query: str, db_url: str):
+    with psycopg.connect(db_url, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(query)
             return cur.rowcount
