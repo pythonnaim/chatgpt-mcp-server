@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or specific domains
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -24,13 +24,13 @@ AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN")
 
 # Multiple database configurations from environment variables
 DATABASE_CONFIGS = {
-    "primary": os.getenv("POSTGRES_URL_PRIMARY") or os.getenv("POSTGRES_URL"),  # Fallback to original
+    "primary": os.getenv("POSTGRES_URL_PRIMARY") or os.getenv("POSTGRES_URL"),
     "analytics": os.getenv("POSTGRES_URL_ANALYTICS"), 
     "reporting": os.getenv("POSTGRES_URL_REPORTING"),
     "staging": os.getenv("POSTGRES_URL_STAGING"),
 }
 
-# Remove None values
+# Remove None values and keep only configured databases
 DATABASE_CONFIGS = {k: v for k, v in DATABASE_CONFIGS.items() if v}
 
 class JsonRpcRequest(BaseModel):
@@ -38,6 +38,28 @@ class JsonRpcRequest(BaseModel):
     method: str
     id: int
     params: dict
+
+def get_database_url(database: str) -> str:
+    """Get database URL by name with proper error handling"""
+    if database not in DATABASE_CONFIGS:
+        available = list(DATABASE_CONFIGS.keys())
+        raise ValueError(f"Database '{database}' not found. Available databases: {available}")
+    if not DATABASE_CONFIGS[database]:
+        raise ValueError(f"Database '{database}' URL is not configured")
+    return DATABASE_CONFIGS[database]
+
+def test_database_connection(database: str) -> tuple[bool, str]:
+    """Test database connection"""
+    try:
+        db_url = get_database_url(database)
+        with psycopg.connect(db_url, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                return True, "Connection successful"
+    except ValueError as e:
+        return False, str(e)
+    except Exception as e:
+        return False, f"Connection failed: {str(e)}"
 
 @app.post("/mcp")
 async def mcp_handler(req: Request, authorization: str = Header(None)):
@@ -50,7 +72,7 @@ async def mcp_handler(req: Request, authorization: str = Header(None)):
         method = rpc.method
         params = rpc.params
         query = params.get("query")
-        database = params.get("database", "primary")  # Default to primary database
+        database = params.get("database", "primary")
     except Exception as e:
         return {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request"}, "id": None}
 
@@ -78,98 +100,208 @@ async def mcp_handler(req: Request, authorization: str = Header(None)):
                 }
             }
 
+        elif method == "get_table_names":
+            # Get all table names from the database
+            database = params.get("database", "primary")
+            
+            # Test connection first
+            connected, message = test_database_connection(database)
+            if not connected:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32000, "message": f"Database connection failed: {message}"}, 
+                    "id": rpc.id
+                }
+            
+            try:
+                table_query = """
+                SELECT table_name, table_type, table_schema
+                FROM information_schema.tables 
+                WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+                ORDER BY table_schema, table_name
+                """
+                tables = run_query(table_query, database)
+                
+                return {
+                    "jsonrpc": "2.0",
+                    "id": rpc.id,
+                    "result": {
+                        "database": database,
+                        "tables": tables,
+                        "table_count": len(tables)
+                    }
+                }
+            except Exception as e:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32000, "message": f"Failed to fetch tables: {str(e)}"}, 
+                    "id": rpc.id
+                }
+
+        elif method == "get_table_schema":
+            # Get schema for a specific table
+            database = params.get("database", "primary")
+            table_name = params.get("table_name")
+            
+            if not table_name:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32602, "message": "table_name parameter is required"}, 
+                    "id": rpc.id
+                }
+            
+            try:
+                schema_query = """
+                SELECT 
+                    column_name,
+                    data_type,
+                    is_nullable,
+                    column_default,
+                    character_maximum_length,
+                    ordinal_position
+                FROM information_schema.columns 
+                WHERE table_name = %s 
+                AND table_schema NOT IN ('information_schema', 'pg_catalog')
+                ORDER BY ordinal_position
+                """
+                columns = run_query_with_params(schema_query, [table_name], database)
+                
+                if not columns:
+                    return {
+                        "jsonrpc": "2.0", 
+                        "error": {"code": -32000, "message": f"Table '{table_name}' not found"}, 
+                        "id": rpc.id
+                    }
+                
+                return {
+                    "jsonrpc": "2.0",
+                    "id": rpc.id,
+                    "result": {
+                        "database": database,
+                        "table_name": table_name,
+                        "columns": columns,
+                        "column_count": len(columns)
+                    }
+                }
+            except Exception as e:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32000, "message": f"Failed to fetch table schema: {str(e)}"}, 
+                    "id": rpc.id
+                }
+
         elif method == "search_across_databases":
-            # Deep search across multiple databases
             search_term = params.get("search_term")
             databases = params.get("databases") or list(DATABASE_CONFIGS.keys())
             table_pattern = params.get("table_pattern", None)
             
+            if not search_term:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32602, "message": "search_term parameter is required"}, 
+                    "id": rpc.id
+                }
+            
             results = []
             for db in databases:
                 try:
+                    # Test connection first
+                    connected, conn_message = test_database_connection(db)
+                    if not connected:
+                        results.append({
+                            "database": db,
+                            "error": f"Connection failed: {conn_message}",
+                            "results": []
+                        })
+                        continue
+                    
+                    db_results = []
+                    
                     if table_pattern:
                         # Search in specific table pattern
-                        search_query = f"""
+                        search_query = """
                         SELECT table_name FROM information_schema.tables 
-                        WHERE table_name LIKE '%{table_pattern}%' 
-                        AND table_schema = 'public'
+                        WHERE table_name ILIKE %s 
+                        AND table_schema NOT IN ('information_schema', 'pg_catalog')
                         """
-                        tables = run_query(search_query, db)
+                        tables = run_query_with_params(search_query, [f'%{table_pattern}%'], db)
                         
-                        db_results = []
                         for table_row in tables:
                             table_name = table_row['table_name']
                             try:
                                 # Get text columns for this table
-                                col_query = f"""
+                                col_query = """
                                 SELECT column_name FROM information_schema.columns 
-                                WHERE table_name = '{table_name}' 
-                                AND data_type IN ('text', 'varchar', 'character varying')
+                                WHERE table_name = %s 
+                                AND data_type IN ('text', 'varchar', 'character varying', 'char')
                                 """
-                                columns = run_query(col_query, db)
+                                columns = run_query_with_params(col_query, [table_name], db)
                                 
                                 if columns:
-                                    # Search in text columns
                                     col_names = [col['column_name'] for col in columns]
-                                    conditions = ' OR '.join([f"{col}::text ILIKE '%{search_term}%'" for col in col_names])
-                                    search_query = f"SELECT * FROM {table_name} WHERE {conditions} LIMIT 10"
-                                    table_results = run_query(search_query, db)
+                                    conditions = ' OR '.join([f'"{col}"::text ILIKE %s' for col in col_names])
+                                    search_params = [f'%{search_term}%'] * len(col_names)
+                                    
+                                    data_query = f'SELECT * FROM "{table_name}" WHERE {conditions} LIMIT 10'
+                                    table_results = run_query_with_params(data_query, search_params, db)
                                     
                                     if table_results:
                                         db_results.append({
                                             "table": table_name,
                                             "matches": table_results
                                         })
-                            except:
+                            except Exception as table_error:
                                 continue
-                        
-                        results.append({
-                            "database": db,
-                            "results": db_results
-                        })
                     else:
                         # General search across all text fields
-                        general_search = f"""
-                        SELECT 
-                            t.table_name,
-                            array_agg(c.column_name) as text_columns
+                        tables_query = """
+                        SELECT DISTINCT t.table_name
                         FROM information_schema.tables t
                         JOIN information_schema.columns c ON t.table_name = c.table_name
-                        WHERE t.table_schema = 'public' 
-                        AND c.data_type IN ('text', 'varchar', 'character varying')
-                        GROUP BY t.table_name
+                        WHERE t.table_schema NOT IN ('information_schema', 'pg_catalog')
+                        AND c.data_type IN ('text', 'varchar', 'character varying', 'char')
                         LIMIT 20
                         """
                         
-                        tables_with_text = run_query(general_search, db)
-                        db_results = []
+                        tables_with_text = run_query(tables_query, db)
                         
                         for table_info in tables_with_text:
                             table_name = table_info['table_name']
-                            text_columns = table_info['text_columns']
-                            
                             try:
-                                conditions = ' OR '.join([f"{col}::text ILIKE '%{search_term}%'" for col in text_columns])
-                                search_query = f"SELECT * FROM {table_name} WHERE {conditions} LIMIT 5"
-                                table_results = run_query(search_query, db)
+                                # Get text columns for this table
+                                col_query = """
+                                SELECT column_name FROM information_schema.columns 
+                                WHERE table_name = %s 
+                                AND data_type IN ('text', 'varchar', 'character varying', 'char')
+                                """
+                                columns = run_query_with_params(col_query, [table_name], db)
                                 
-                                if table_results:
-                                    db_results.append({
-                                        "table": table_name,
-                                        "matches": table_results
-                                    })
-                            except:
+                                if columns:
+                                    col_names = [col['column_name'] for col in columns]
+                                    conditions = ' OR '.join([f'"{col}"::text ILIKE %s' for col in col_names])
+                                    search_params = [f'%{search_term}%'] * len(col_names)
+                                    
+                                    data_query = f'SELECT * FROM "{table_name}" WHERE {conditions} LIMIT 5'
+                                    table_results = run_query_with_params(data_query, search_params, db)
+                                    
+                                    if table_results:
+                                        db_results.append({
+                                            "table": table_name,
+                                            "matches": table_results
+                                        })
+                            except Exception:
                                 continue
-                        
-                        results.append({
-                            "database": db,
-                            "results": db_results
-                        })
+                    
+                    results.append({
+                        "database": db,
+                        "results": db_results
+                    })
                         
                 except Exception as e:
                     results.append({
                         "database": db,
-                        "error": str(e)
+                        "error": str(e),
+                        "results": []
                     })
             
             return {
@@ -182,107 +314,44 @@ async def mcp_handler(req: Request, authorization: str = Header(None)):
                 }
             }
 
-        elif method == "get_database_schema":
-            database = params.get("database", "primary")
-            table_name = params.get("table_name", None)
+        elif method == "list_databases":
+            # Test connections for all databases
+            db_status = {}
+            for db_name in DATABASE_CONFIGS.keys():
+                connected, message = test_database_connection(db_name)
+                db_status[db_name] = {
+                    "connected": connected,
+                    "message": message,
+                    "url_configured": bool(DATABASE_CONFIGS[db_name])
+                }
             
-            if table_name:
-                # Get columns for specific table
-                schema_query = """
-                SELECT column_name, data_type, is_nullable, column_default
-                FROM information_schema.columns 
-                WHERE table_name = %s AND table_schema = 'public'
-                ORDER BY ordinal_position
-                """
-                rows = run_query_with_params(schema_query, [table_name], database)
-            else:
-                # Get all tables
-                schema_query = """
-                SELECT table_name, table_type 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                ORDER BY table_name
-                """
-                rows = run_query(schema_query, database)
+            return {
+                "jsonrpc": "2.0",
+                "id": rpc.id,
+                "result": {
+                    "databases": db_status,
+                    "count": len(DATABASE_CONFIGS)
+                }
+            }
+
+        elif method == "test_connection":
+            database = params.get("database", "primary")
+            connected, message = test_database_connection(database)
             
             return {
                 "jsonrpc": "2.0",
                 "id": rpc.id,
                 "result": {
                     "database": database,
-                    "table_name": table_name,
-                    "schema": rows
-                }
-            }
-
-        elif method == "list_databases":
-            return {
-                "jsonrpc": "2.0",
-                "id": rpc.id,
-                "result": {
-                    "databases": list(DATABASE_CONFIGS.keys()),
-                    "count": len(DATABASE_CONFIGS)
-                }
-            }
-
-        elif method == "cross_reference_search":
-            # Search for related data across databases using common fields
-            reference_value = params.get("reference_value")
-            reference_fields = params.get("reference_fields", ["id", "user_id", "customer_id", "email"])
-            databases = params.get("databases") or list(DATABASE_CONFIGS.keys())
-            
-            cross_results = {}
-            
-            for db in databases:
-                try:
-                    db_results = []
-                    for field in reference_fields:
-                        # Find tables with this field
-                        field_query = f"""
-                        SELECT DISTINCT table_name 
-                        FROM information_schema.columns 
-                        WHERE column_name = '{field}' AND table_schema = 'public'
-                        """
-                        tables = run_query(field_query, db)
-                        
-                        for table_row in tables:
-                            table_name = table_row['table_name']
-                            try:
-                                # Search for the reference value
-                                search_query = f"""
-                                SELECT * FROM {table_name} 
-                                WHERE {field}::text = '{reference_value}' 
-                                LIMIT 5
-                                """
-                                matches = run_query(search_query, db)
-                                
-                                if matches:
-                                    db_results.append({
-                                        "table": table_name,
-                                        "field": field,
-                                        "matches": matches
-                                    })
-                            except:
-                                continue
-                    
-                    cross_results[db] = db_results
-                    
-                except Exception as e:
-                    cross_results[db] = {"error": str(e)}
-            
-            return {
-                "jsonrpc": "2.0",
-                "id": rpc.id,
-                "result": {
-                    "reference_value": reference_value,
-                    "cross_reference_results": cross_results
+                    "connected": connected,
+                    "message": message
                 }
             }
 
         else:
             available_methods = [
-                "fetch_data", "execute_query", "search_across_databases", 
-                "get_database_schema", "list_databases", "cross_reference_search"
+                "fetch_data", "execute_query", "get_table_names", "get_table_schema",
+                "search_across_databases", "list_databases", "test_connection"
             ]
             return {
                 "jsonrpc": "2.0", 
@@ -300,17 +369,6 @@ async def mcp_handler(req: Request, authorization: str = Header(None)):
             "id": rpc.id
         }
 
-
-def get_database_url(database: str) -> str:
-    """Get database URL by name"""
-    if database not in DATABASE_CONFIGS:
-        available = list(DATABASE_CONFIGS.keys())
-        raise ValueError(f"Database '{database}' not found. Available databases: {available}")
-    if not DATABASE_CONFIGS[database]:
-        raise ValueError(f"Database '{database}' URL is not configured")
-    return DATABASE_CONFIGS[database]
-
-
 def run_query(query: str, database: str = "primary"):
     """Execute a query on the specified database"""
     db_url = get_database_url(database)
@@ -323,7 +381,6 @@ def run_query(query: str, database: str = "primary"):
                 return [dict(zip(colnames, row)) for row in cur.fetchall()]
             else:
                 return []
-
 
 def run_query_with_params(query: str, params: list, database: str = "primary"):
     """Execute a parameterized query on the specified database"""
@@ -338,7 +395,6 @@ def run_query_with_params(query: str, params: list, database: str = "primary"):
             else:
                 return []
 
-
 def run_exec(query: str, database: str = "primary"):
     """Execute a command on the specified database"""
     db_url = get_database_url(database)
@@ -348,31 +404,68 @@ def run_exec(query: str, database: str = "primary"):
             cur.execute(query)
             return cur.rowcount
 
-
 # Health check endpoint
 @app.get("/health")
 async def health_check():
     """Check the health of all configured databases"""
     health_status = {}
+    overall_status = "healthy"
     
-    for db_name, db_url in DATABASE_CONFIGS.items():
-        try:
-            with psycopg.connect(db_url, autocommit=True) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                    health_status[db_name] = "healthy"
-        except Exception as e:
-            health_status[db_name] = f"unhealthy: {str(e)}"
+    if not DATABASE_CONFIGS:
+        return {
+            "status": "error",
+            "message": "No databases configured",
+            "databases": {}
+        }
+    
+    for db_name in DATABASE_CONFIGS.keys():
+        connected, message = test_database_connection(db_name)
+        health_status[db_name] = {
+            "connected": connected,
+            "message": message
+        }
+        if not connected:
+            overall_status = "degraded"
     
     return {
-        "status": "ok", 
+        "status": overall_status, 
         "databases": health_status,
-        "total_databases": len(DATABASE_CONFIGS)
+        "total_databases": len(DATABASE_CONFIGS),
+        "configured_databases": list(DATABASE_CONFIGS.keys())
     }
 
+@app.get("/")
+async def root():
+    """Root endpoint with server info"""
+    return {
+        "message": "Multi-Database MCP Server",
+        "version": "2.0.0",
+        "configured_databases": list(DATABASE_CONFIGS.keys()),
+        "available_methods": [
+            "fetch_data", "execute_query", "get_table_names", "get_table_schema",
+            "search_across_databases", "list_databases", "test_connection"
+        ],
+        "endpoints": {
+            "mcp": "/mcp",
+            "health": "/health"
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
     print("Starting Multi-Database MCP Server for Deep Search...")
-    print(f"Available databases: {list(DATABASE_CONFIGS.keys())}")
+    
+    if not DATABASE_CONFIGS:
+        print("⚠️  WARNING: No databases configured!")
+        print("Add database URLs to your .env file:")
+        print("POSTGRES_URL_PRIMARY=postgresql://user:password@host:5432/database")
+    else:
+        print(f"✅ Configured databases: {list(DATABASE_CONFIGS.keys())}")
+        
+        # Test connections on startup
+        for db_name in DATABASE_CONFIGS.keys():
+            connected, message = test_database_connection(db_name)
+            status = "✅" if connected else "❌"
+            print(f"{status} {db_name}: {message}")
+    
     uvicorn.run(app, host="0.0.0.0", port=8000)
