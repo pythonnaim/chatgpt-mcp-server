@@ -87,8 +87,6 @@ async def mcp_handler(req: Request, authorization: str = Header(None)):
         return {"jsonrpc": "2.0", "error": {"code": -32000, "message": str(e)}, "id": rpc.id}
 
 
-def run_query(query: str, db_url: str):
-    with psycopg.connect(db_url, autocommit=True) as conn:
 def run_query(query: str):
     with psycopg.connect(DB_URL, autocommit=True) as conn:
         with conn.cursor() as cur:
@@ -97,8 +95,6 @@ def run_query(query: str):
             return [dict(zip(colnames, row)) for row in cur.fetchall()]
 
 
-def run_exec(query: str, db_url: str):
-    with psycopg.connect(db_url, autocommit=True) as conn:
 def run_exec(query: str):
     with psycopg.connect(DB_URL, autocommit=True) as conn:
         with conn.cursor() as cur:
